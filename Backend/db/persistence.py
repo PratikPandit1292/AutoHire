@@ -19,25 +19,25 @@ def get_connection():
     return psycopg2.connect(os.getenv("DATABASE_URL"))
 
 
-def save_structured_jd(job_id: str, jd_text: str, structured_jd: dict):
+def insert_job(jd_text: str, structured_jd: dict) -> int:
     """
-    Persists the JD Analyzer's output onto the `jobs` row.
-    Assumes `jobs` has a `raw_text` column and a `structured_data` (JSONB) column.
-    Adjust column names if your Phase 1 schema differs.
+    Inserts a new job row with its analyzed structured data and
+    returns the auto-generated integer id.
     """
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE jobs
-                SET raw_jd_text = %s,
-                structured_requirements = %s
-                WHERE id = %s
+                INSERT INTO jobs (raw_jd_text, structured_requirements)
+                VALUES (%s, %s)
+                RETURNING id
                 """,
-                (jd_text, json.dumps(structured_jd), job_id),
+                (jd_text, json.dumps(structured_jd)),
             )
+            job_id = cur.fetchone()[0]
         conn.commit()
+        return job_id
     finally:
         conn.close()
 

@@ -1,22 +1,20 @@
 """
 agents/resume_screener.py
-
-Two-stage screener:
-  1. Fast pre-filter with ChromaDB (narrows N resumes down to top-K by
-     semantic similarity to the JD).
-  2. Deep reasoning with Groq's free API (Llama 3.3 70B), run only on
-     the narrowed set.
 """
 
 import os
 import json
 import logging
+import time
+import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import chromadb
-from groq import Groq
+from groq import Groq, RateLimitError
 
 from db.persistence import fetch_resume_text, save_screening_result, insert_candidate, fetch_job
+
 logger = logging.getLogger("autohire.resume_screener")
 
 chroma_client = chromadb.PersistentClient(path="./chroma_data")
@@ -25,6 +23,50 @@ collection = chroma_client.get_or_create_collection(name="resume_embeddings")
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 MODEL = "llama-3.3-70b-versatile"
+
+
+class RateLimiter:
+    """
+    Shared, thread-safe sliding-window rate limiter.
+
+    Groq's free tier caps requests-per-minute (RPM) at the account level,
+    not per-request — so previously, every /resumes/screen call spun up
+    its own ThreadPoolExecutor unaware of any other in-flight request,
+    and all of them independently blew through the shared Groq limit.
+
+    This limiter is a single module-level instance shared by every
+    thread across every request, so all Groq calls in the whole process
+    respect one real budget instead of racing each other.
+    """
+
+    def __init__(self, max_calls: int, period_seconds: float = 60.0):
+        self.max_calls = max_calls
+        self.period_seconds = period_seconds
+        self._calls = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                # Drop timestamps older than the window
+                while self._calls and now - self._calls[0] >= self.period_seconds:
+                    self._calls.popleft()
+
+                if len(self._calls) < self.max_calls:
+                    self._calls.append(now)
+                    return
+
+                # Window is full — figure out how long until the oldest
+                # call ages out, and sleep just that long.
+                sleep_for = self.period_seconds - (now - self._calls[0])
+
+            time.sleep(max(sleep_for, 0.05))
+
+
+# Cap at 25 (not 30) to leave headroom below Groq's actual RPM limit,
+# since other traffic (e.g. JD analysis calls) may share the same key.
+groq_rate_limiter = RateLimiter(max_calls=25, period_seconds=60.0)
 
 SCREENER_PROMPT = """You are a resume screening assistant.
 Given structured job requirements and a candidate's resume, score the fit from 0-100.
@@ -43,14 +85,7 @@ Candidate Resume:
 """
 
 
-from db.persistence import fetch_resume_text, save_screening_result, insert_candidate
-
 def store_resume_embedding(resume_text: str) -> str:
-    """
-    Inserts the resume into Postgres (source of truth for resume text),
-    then adds the embedding to ChromaDB using the same id, so both stores
-    always agree on candidate identity.
-    """
     candidate_id = insert_candidate(resume_text)
     collection.add(documents=[resume_text], ids=[str(candidate_id)])
     return str(candidate_id)
@@ -73,22 +108,49 @@ def _parse_json_response(raw_output: str) -> dict:
             raise
 
 
-def screen_candidate(structured_jd: dict, resume_text: str) -> dict:
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": SCREENER_PROMPT.format(
-                    structured_jd=json.dumps(structured_jd), resume_text=resume_text
-                ),
-            }
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-        max_completion_tokens=500,
-    )
-    return _parse_json_response(response.choices[0].message.content)
+def screen_candidate(structured_jd: dict, resume_text: str, max_retries: int = 4) -> dict:
+    """
+    Calls Groq with retry-on-429 using exponential backoff, since the free
+    tier's TPM cap gets hit routinely under concurrent load.
+    """
+    delay = 2.0
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            # Block here (not inside the try/except) until a slot in the
+            # shared rate limit window is free. This is what actually
+            # prevents concurrent requests from blowing through Groq's
+            # RPM limit in the first place — the retry/backoff below is
+            # now a safety net, not the primary defense.
+            groq_rate_limiter.acquire()
+
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": SCREENER_PROMPT.format(
+                            structured_jd=json.dumps(structured_jd), resume_text=resume_text
+                        ),
+                    }
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.2,
+                max_completion_tokens=500,
+            )
+            return _parse_json_response(response.choices[0].message.content)
+
+        except RateLimitError as e:
+            last_error = e
+            logger.warning(
+                "Rate limited (attempt %d/%d), backing off %.1fs",
+                attempt + 1, max_retries, delay,
+            )
+            time.sleep(delay)
+            delay *= 2  # exponential backoff: 2s, 4s, 8s, 16s
+
+    raise last_error
 
 
 def _screen_one(job_id: str, candidate_id: str, structured_jd: dict) -> dict:
@@ -99,19 +161,16 @@ def _screen_one(job_id: str, candidate_id: str, structured_jd: dict) -> dict:
     return result
 
 
-def run_screening(job_id: str, k: int = 20, max_workers: int = 3) -> list[dict]:
+def run_screening(job_id: str, k: int = 20, max_workers: int = 3) -> dict:
     job = fetch_job(job_id)
     jd_text = job["raw_jd_text"]
     structured_jd = job["structured_requirements"]
-    """
-    Narrows the candidate pool with ChromaDB, then screens the narrowed set
-    with Groq. max_workers is kept modest (3) since Groq's free tier has a
-    per-minute request cap -- too much concurrency will trip 429s faster
-    than it saves time.
-    """
+
     top_candidate_ids = get_top_candidates(jd_text, k=k)
 
     results = []
+    failed = []
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(_screen_one, job_id, candidate_id, structured_jd): candidate_id
@@ -121,7 +180,11 @@ def run_screening(job_id: str, k: int = 20, max_workers: int = 3) -> list[dict]:
             candidate_id = futures[future]
             try:
                 results.append(future.result())
-            except Exception:
+            except Exception as e:
                 logger.exception("Screening failed for candidate_id=%s", candidate_id)
+                failed.append({"candidate_id": candidate_id, "reason": str(e)})
 
-    return sorted(results, key=lambda r: r["score"], reverse=True)
+    return {
+        "results": sorted(results, key=lambda r: r["score"], reverse=True),
+        "failed_candidates": failed,
+    }

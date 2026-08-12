@@ -3,13 +3,12 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from agents.jd_analyzer import analyze_jd
-from db.persistence import save_structured_jd
+from db.persistence import insert_job
 
 router = APIRouter()
 
 
 class JDAnalyzeRequest(BaseModel):
-    job_id: str
     jd_text: str
 
 
@@ -22,5 +21,5 @@ def jd_analyze_endpoint(payload: JDAnalyzeRequest):
     except Exception:
         raise HTTPException(status_code=502, detail="JD Analyzer failed to produce valid output")
 
-    save_structured_jd(payload.job_id, payload.jd_text, structured)
-    return structured
+    job_id = insert_job(payload.jd_text, structured)
+    return {"job_id": job_id, "structured_requirements": structured}

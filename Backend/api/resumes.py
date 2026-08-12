@@ -1,6 +1,8 @@
 # api/resumes.py
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
+from pypdf import PdfReader
+import io
 
 from agents.resume_screener import run_screening, store_resume_embedding
 
@@ -11,14 +13,27 @@ class ScreenRequest(BaseModel):
     job_id: str
 
 
-class EmbedResumeRequest(BaseModel):
-    resume_text: str
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(file_bytes))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    if not text.strip():
+        raise ValueError("No extractable text found in PDF")
+    return text
 
 
 @router.post("/resumes/embed")
-def embed_resume_endpoint(payload: EmbedResumeRequest):
+async def embed_resume_endpoint(file: UploadFile = File(...)):
     """Call this once per candidate after upload, before running /resumes/screen."""
-    candidate_id = store_resume_embedding(payload.resume_text)
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+
+    file_bytes = await file.read()
+    try:
+        resume_text = extract_text_from_pdf(file_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    candidate_id = store_resume_embedding(resume_text)
     return {"status": "embedded", "candidate_id": candidate_id}
 
 

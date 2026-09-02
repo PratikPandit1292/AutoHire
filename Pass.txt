@@ -1,0 +1,8 @@
+For Postgres DATABASE
+
+psql -U Postgres
+
+password: Newuser@7847
+
+
+/c autohore
